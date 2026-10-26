@@ -17,7 +17,9 @@ app.get("/health", (req, res) => {
 
 app.post("/chat", async (req, res) => {
   try {
-    const message = String(req.body.message || "").trim();
+    const message = String(
+      (req.body && req.body.message) || ""
+    ).trim();
 
     if (!message) {
       return res.status(400).json({
@@ -35,14 +37,13 @@ app.post("/chat", async (req, res) => {
 
     if (!apiKey) {
       console.error("GEMINI_API_KEY is missing");
-
       return res.status(500).json({
         reply: "AI setup pending hai. Please try again later."
       });
     }
 
     const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
       {
         method: "POST",
         headers: {
@@ -52,7 +53,7 @@ app.post("/chat", async (req, res) => {
         body: JSON.stringify({
           systemInstruction: {
             parts: [{
-              text: "You are Aivora AI, a helpful and friendly AI assistant. Answer clearly and accurately. Reply in the language used by the user, including Hindi or Hinglish when appropriate."
+              text: "You are Aivora AI, a helpful and friendly AI assistant. Answer accurately. Reply in the language used by the user, including Hindi, Hinglish or English."
             }]
           },
           contents: [{
@@ -76,24 +77,26 @@ app.post("/chat", async (req, res) => {
         JSON.stringify(data.error || {})
       );
 
-      if (response.status === 429) {
-        return res.status(429).json({
-          reply: "AI ki request limit abhi poori hai. Thodi der baad try karein."
-        });
-      }
-
-      return res.status(502).json({
-        reply: "Gemini AI se response nahi mila. Please dobara try karein."
+      return res.status(
+        response.status === 429 ? 429 : 502
+      ).json({
+        reply: "Gemini se response nahi mila. Please dobara try karein."
       });
     }
 
-    const reply = (data.candidates || [])
-      .flatMap(candidate =>
-        (candidate.content?.parts || [])
-          .map(part => part.text || "")
-      )
-      .join("")
-      .trim();
+    const candidates = data.candidates || [];
+    let reply = "";
+
+    for (const candidate of candidates) {
+      const parts =
+        (candidate.content && candidate.content.parts) || [];
+
+      for (const part of parts) {
+        reply += part.text || "";
+      }
+    }
+
+    reply = reply.trim();
 
     if (!reply) {
       return res.status(502).json({
