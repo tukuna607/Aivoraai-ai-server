@@ -2,12 +2,12 @@
   "name": "aivora-ai-server",
   "version": "1.0.0",
   "description": "Aivora AI Backend",
-  "main": "server.js",
+  "main": "Server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node Server.js"
   },
   "dependencies": {
-    "express": "^4.21.2"
-    "cors":"^2.8.5"
+    "express": "^4.21.2",
+    "cors": "^2.8.5"
   }
 }
