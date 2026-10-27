@@ -182,4 +182,4 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Aivora AI server running on port " + PORT);
   console.log("Gemini model configured: " + GEMINI_MODEL);
 });
-        
+              
