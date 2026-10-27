@@ -12,7 +12,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // Change this model only after confirming it is available
 // for your API key in Google AI Studio.
 const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
 app.get("/", (req, res) => {
   res.status(200).json({
