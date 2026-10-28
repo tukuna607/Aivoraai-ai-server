@@ -1,3 +1,4 @@
+
 const express = require("express");
 const cors = require("cors");
 
@@ -8,59 +9,29 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 10000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// Change this model only after confirming it is available
-// for your API key in Google AI Studio.
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
-app.get("/", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    service: "Aivora AI",
-    message: "Aivora AI server is running"
-  });
-});
+const MAX_ATTEMPTS = 3;
+const REQUEST_TIMEOUT_MS = 25000;
 
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "ok"
-  });
-});
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-app.post("/chat", async (req, res) => {
-  try {
-    const message =
-      typeof req.body.message === "string"
-        ? req.body.message.trim()
-        : "";
+async function askGemini(message) {
+  let lastStatus = 0;
+  let lastMessage = "Gemini request failed";
 
-    if (!message) {
-      return res.status(400).json({
-        error: "Message required",
-        reply: "Please enter a message."
-      });
-    }
-
-    if (!GEMINI_API_KEY) {
-      console.error("GEMINI_API_KEY is missing");
-
-      return res.status(500).json({
-        error: "Server configuration error",
-        reply: "AI server configuration is incomplete."
-      });
-    }
-
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(),
-      25000
+      REQUEST_TIMEOUT_MS
     );
 
-    let response;
-
     try {
-      response = await fetch(
+      const response = await fetch(
         "https://generativelanguage.googleapis.com/v1beta/models/" +
           encodeURIComponent(GEMINI_MODEL) +
           ":generateContent",
@@ -72,21 +43,17 @@ app.post("/chat", async (req, res) => {
           },
           body: JSON.stringify({
             systemInstruction: {
-              parts: [
-                {
-                  text:
-                    "You are Aivora AI, a helpful AI assistant. " +
-                    "Answer accurately and clearly. " +
-                    "Reply in the user's language when possible."
-                }
-              ]
+              parts: [{
+                text:
+                  "You are Aivora AI, a helpful AI assistant. " +
+                  "Answer accurately and clearly. " +
+                  "Reply in the user's language when possible."
+              }]
             },
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: message }]
-              }
-            ],
+            contents: [{
+              role: "user",
+              parts: [{ text: message }]
+            }],
             generationConfig: {
               temperature: 0.7,
               maxOutputTokens: 2048
@@ -95,85 +62,169 @@ app.post("/chat", async (req, res) => {
           signal: controller.signal
         }
       );
-    } finally {
-      clearTimeout(timeout);
-    }
 
-    const data = await response.json();
+      const data = await response.json();
 
-    if (!response.ok) {
-      const upstreamMessage =
-        data &&
-        data.error &&
-        data.error.message
+      if (response.ok) {
+        const reply =
+          data &&
+          data.candidates &&
+          data.candidates[0] &&
+          data.candidates[0].content &&
+          data.candidates[0].content.parts
+            ? data.candidates[0].content.parts
+                .map(part => part.text || "")
+                .join("")
+                .trim()
+            : "";
+
+        if (!reply) {
+          const blockReason =
+            data &&
+            data.candidates &&
+            data.candidates[0] &&
+            data.candidates[0].finishReason;
+
+          const error = new Error(
+            blockReason
+              ? "Gemini returned no text: " + blockReason
+              : "Gemini returned an empty response"
+          );
+          error.status = 502;
+          throw error;
+        }
+
+        return {
+          reply: reply,
+          model: GEMINI_MODEL
+        };
+      }
+
+      lastStatus = response.status;
+      lastMessage =
+        data && data.error && data.error.message
           ? data.error.message
           : "Gemini request failed";
 
       console.error(
-        "Gemini API error:",
-        response.status,
-        upstreamMessage
+        "Gemini attempt " + attempt + "/" + MAX_ATTEMPTS +
+        " failed:",
+        lastStatus,
+        lastMessage
       );
 
-      return res.status(
-        response.status === 429 ? 429 :
-        response.status === 503 ? 503 :
-        response.status === 504 ? 504 : 502
-      ).json({
-        error: "Gemini API error",
-        upstreamStatus: response.status,
-        reply:
-          response.status === 503
-            ? "Gemini is temporarily unavailable. Please try again."
-            : response.status === 429
-            ? "Gemini quota or rate limit reached. Please try later."
-            : "Aivora AI could not get a response from Gemini."
-      });
-    }
+      const retryable = [429, 500, 503, 504].includes(lastStatus);
 
-    const reply =
-      data &&
-      data.candidates &&
-      data.candidates[0] &&
-      data.candidates[0].content &&
-      data.candidates[0].content.parts
-        ? data.candidates[0].content.parts
-            .map(part => part.text || "")
-            .join("")
-            .trim()
-        : "";
+      if (!retryable || attempt === MAX_ATTEMPTS) {
+        break;
+      }
+    } catch (error) {
+      if (error.status === 502) {
+        throw error;
+      }
 
-    if (!reply) {
+      lastMessage =
+        error.name === "AbortError"
+          ? "Gemini request timed out"
+          : error.message || "Network error";
+
+      lastStatus = error.status || 0;
+
       console.error(
-        "Gemini returned no text:",
-        JSON.stringify(data).slice(0, 1000)
+        "Gemini attempt " + attempt + "/" + MAX_ATTEMPTS +
+        " error:",
+        lastMessage
       );
 
-      return res.status(502).json({
-        error: "Empty Gemini response",
-        reply: "Gemini returned no text. Please try again."
-      });
+      if (attempt === MAX_ATTEMPTS) {
+        break;
+      }
+    } finally {
+      clearTimeout(timeout);
     }
 
-    return res.status(200).json({
-      reply: reply,
-      model: GEMINI_MODEL
+    const delay = 1000 * Math.pow(2, attempt - 1);
+    console.log("Retrying Gemini in " + delay + "ms");
+    await wait(delay);
+  }
+
+  const error = new Error(lastMessage);
+  error.status = lastStatus || 502;
+  throw error;
+}
+
+app.get("/", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    service: "Aivora AI",
+    message: "Aivora AI server is running"
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    ai: "Gemini",
+    configured: Boolean(GEMINI_API_KEY),
+    model: GEMINI_MODEL
+  });
+});
+
+app.post("/chat", async (req, res) => {
+  const message =
+    typeof req.body.message === "string"
+      ? req.body.message.trim()
+      : "";
+
+  if (!message) {
+    return res.status(400).json({
+      error: "Message required",
+      reply: "Please enter a message."
     });
-  } catch (error) {
-    if (error.name === "AbortError") {
-      console.error("Gemini request timed out");
+  }
 
-      return res.status(504).json({
-        error: "Request timeout",
-        reply: "The AI response took too long. Please try again."
-      });
-    }
-
-    console.error("Chat server error:", error.message);
+  if (!GEMINI_API_KEY) {
+    console.error("GEMINI_API_KEY is missing");
 
     return res.status(500).json({
-      error: "Internal server error",
-      reply: "Aivora AI encountered an unexpected error."
+      error: "Server configuration error",
+      reply: "AI server configuration is incomplete."
+    });
+  }
+
+  try {
+    const result = await askGemini(message);
+
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error(
+      "Chat request failed:",
+      error.status || 500,
+      error.message
+    );
+
+    const status = error.status || 502;
+
+    if (status === 429) {
+      return res.status(429).json({
+        error: "Gemini rate limit",
+        upstreamStatus: 429,
+        reply: "Gemini is busy or its quota is limited. Please try later."
+      });
+    }
+
+    if (status === 503 || status === 500 || status === 504) {
+      return res.status(status).json({
+        error: "Gemini temporarily unavailable",
+        upstreamStatus: status,
+        reply: "Gemini is temporarily unavailable. Please try again later."
+      });
+    }
+
+    return res.status(502).json({
+      error: "Gemini request failed",
+      upstreamStatus: status,
+      reply: "Aivora AI could not get a response from Gemini."
     });
   }
 });
@@ -181,5 +232,6 @@ app.post("/chat", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Aivora AI server running on port " + PORT);
   console.log("Gemini model configured: " + GEMINI_MODEL);
+  console.log("Automatic retry enabled: " + MAX_ATTEMPTS + " attempts");
 });
-              
+    
