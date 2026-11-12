@@ -1,11 +1,10 @@
-
 const express = require("express");
 const cors = require("cors");
 
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 10000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -23,7 +22,6 @@ function wait(ms) {
 }
 
 function extractText(data) {
-  // Convenience field, if provided by the API
   if (
     typeof data.output_text === "string" &&
     data.output_text.trim()
@@ -31,7 +29,6 @@ function extractText(data) {
     return data.output_text.trim();
   }
 
-  // REST Interactions API: text is inside steps
   if (Array.isArray(data.steps)) {
     return data.steps
       .filter(step => step.type === "model_output")
@@ -44,7 +41,6 @@ function extractText(data) {
       .trim();
   }
 
-  // Fallback for compatible response formats
   if (Array.isArray(data.output)) {
     return data.output
       .filter(item => item.type === "model_output")
@@ -60,18 +56,34 @@ function extractText(data) {
   return "";
 }
 
-async function askGemini(message) {
+async function askGemini(message, imageBase64, mimeType) {
   let lastStatus = 502;
   let lastMessage = "Gemini request failed";
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController();
+
     const timeout = setTimeout(
       () => controller.abort(),
       REQUEST_TIMEOUT_MS
     );
 
     try {
+      const input = [];
+
+      if (imageBase64) {
+        input.push({
+          type: "image",
+          data: imageBase64,
+          mime_type: mimeType
+        });
+      }
+
+      input.push({
+        type: "text",
+        text: message
+      });
+
       const response = await fetch(API_URL, {
         method: "POST",
         headers: {
@@ -80,15 +92,14 @@ async function askGemini(message) {
         },
         body: JSON.stringify({
           model: GEMINI_MODEL,
-          input: message,
+          input: imageBase64 ? input : message,
           system_instruction:
-  "You are Aivora AI, an AI assistant developed as part of the Aivora AI project. " +
-  "Your creator is the creator of the Aivora AI project. " +
-  "You use Google's Gemini AI technology to generate responses. " +
-  "If asked who created you, explain that you are Aivora AI, developed as part of the Aivora AI project, and that your underlying AI technology is provided by Google Gemini. " +
-  "Never falsely claim that Google created the Aivora AI app itself. " +
-  "Give accurate, clear and useful answers. " +
-  "Reply in the user's language when possible."
+            "You are Aivora AI, an AI assistant developed as part of the Aivora AI project. " +
+            "Your underlying AI technology is provided by Google Gemini. " +
+            "Never falsely claim that Google created the Aivora AI app itself. " +
+            "Give accurate, clear and useful answers. " +
+            "When an image is provided, carefully analyze it and answer questions about it. " +
+            "Reply in the user's language when possible."
         }),
         signal: controller.signal
       });
@@ -110,11 +121,13 @@ async function askGemini(message) {
             : raw || "Gemini request failed";
 
         console.error(
-          "Gemini attempt " + attempt + "/" + MAX_ATTEMPTS +
-          " failed: " + lastStatus + " " + lastMessage
+          "Gemini attempt " + attempt + " failed:",
+          lastStatus,
+          lastMessage
         );
 
-        const retryable = [429, 500, 503, 504].includes(lastStatus);
+        const retryable =
+          [429, 500, 503, 504].includes(lastStatus);
 
         if (!retryable || attempt === MAX_ATTEMPTS) {
           break;
@@ -123,8 +136,6 @@ async function askGemini(message) {
         const reply = extractText(data);
 
         if (reply) {
-          console.log("Gemini response received successfully");
-
           return {
             reply: reply,
             model: GEMINI_MODEL
@@ -132,32 +143,17 @@ async function askGemini(message) {
         }
 
         lastStatus = 502;
-        lastMessage =
-          "No text found. Interaction status: " +
-          (data.status || "unknown") +
-          "; response steps: " +
-          (Array.isArray(data.steps)
-            ? data.steps.map(step => step.type).join(",")
-            : "missing");
-
-        console.error("Gemini response parsing error:", lastMessage);
-
-        // Do not retry an HTTP 200 response with no text.
+        lastMessage = "Gemini returned no text response.";
         break;
       }
     } catch (error) {
-      lastStatus = error.name === "AbortError"
-        ? 504
-        : 502;
+      lastStatus =
+        error.name === "AbortError" ? 504 : 502;
 
-      lastMessage = error.name === "AbortError"
-        ? "Gemini request timed out"
-        : error.message || "Network error";
-
-      console.error(
-        "Gemini attempt " + attempt + "/" + MAX_ATTEMPTS +
-        " error: " + lastMessage
-      );
+      lastMessage =
+        error.name === "AbortError"
+          ? "Gemini request timed out"
+          : error.message || "Network error";
 
       if (attempt === MAX_ATTEMPTS) {
         break;
@@ -167,17 +163,14 @@ async function askGemini(message) {
     }
 
     if (attempt < MAX_ATTEMPTS) {
-      const delay = 1000 * Math.pow(2, attempt - 1);
-      console.log("Retrying Gemini in " + delay + "ms");
-      await wait(delay);
+      await wait(1000 * Math.pow(2, attempt - 1));
     }
   }
 
   const error = new Error(lastMessage);
   error.status = lastStatus;
   throw error;
-}
-
+    }
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -192,7 +185,8 @@ app.get("/health", (req, res) => {
     ai: "Gemini",
     configured: Boolean(GEMINI_API_KEY),
     model: GEMINI_MODEL,
-    api: "Interactions"
+    api: "Interactions",
+    imageSupport: true
   });
 });
 
@@ -202,11 +196,51 @@ app.post("/chat", async (req, res) => {
       ? req.body.message.trim()
       : "";
 
-  if (!message) {
+  const imageBase64 =
+    typeof req.body?.imageBase64 === "string"
+      ? req.body.imageBase64.replace(
+          /^data:image\/[a-zA-Z0-9.+-]+;base64,/,
+          ""
+        )
+      : "";
+
+  const mimeType =
+    typeof req.body?.mimeType === "string"
+      ? req.body.mimeType
+      : "image/jpeg";
+
+  if (!message && !imageBase64) {
     return res.status(400).json({
-      error: "Message required",
-      reply: "Please enter a message."
+      error: "Message or image required",
+      reply: "Please enter a message or select a photo."
     });
+  }
+
+  if (imageBase64) {
+    if (!["image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+      return res.status(400).json({
+        error: "Unsupported image type",
+        reply: "Please select a JPG, PNG or WEBP image."
+      });
+    }
+
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(imageBase64)) {
+      return res.status(400).json({
+        error: "Invalid image data",
+        reply: "The selected image data is invalid."
+      });
+    }
+
+    const estimatedSize = Math.floor(
+      imageBase64.length * 3 / 4
+    );
+
+    if (estimatedSize > 14 * 1024 * 1024) {
+      return res.status(413).json({
+        error: "Image too large",
+        reply: "Please select an image smaller than 14 MB."
+      });
+    }
   }
 
   if (!GEMINI_API_KEY) {
@@ -217,8 +251,17 @@ app.post("/chat", async (req, res) => {
   }
 
   try {
-    const result = await askGemini(message);
+    const prompt = message ||
+      "Please describe this image in detail.";
+
+    const result = await askGemini(
+      prompt,
+      imageBase64,
+      mimeType
+    );
+
     return res.status(200).json(result);
+
   } catch (error) {
     const status = error.status || 502;
 
@@ -228,7 +271,8 @@ app.post("/chat", async (req, res) => {
       error.message
     );
 
-    let reply = "Aivora AI could not get a response from Gemini.";
+    let reply =
+      "Aivora AI could not get a response from Gemini.";
 
     if (status === 429) {
       reply = "Gemini quota limit reached. Please try again later.";
@@ -249,6 +293,6 @@ app.post("/chat", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Aivora AI server running on port " + PORT);
   console.log("Gemini model configured: " + GEMINI_MODEL);
+  console.log("Image support enabled");
   console.log("API: Interactions");
 });
-      
