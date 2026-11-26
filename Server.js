@@ -1,6 +1,30 @@
 const express = require("express");
 const cors = require("cors");
+const admin = require("firebase-admin");
+const fs = require("fs");
 
+const firebaseKeyPath =
+  process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+  "/etc/secrets/firebase-service-account.json";
+
+let firebaseReady = false;
+
+try {
+  if (fs.existsSync(firebaseKeyPath)) {
+    const serviceAccount = require(firebaseKeyPath);
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+
+    firebaseReady = true;
+    console.log("Firebase Admin initialized successfully");
+  } else {
+    console.error("Firebase service account file not found");
+  }
+} catch (error) {
+  console.error("Firebase Admin initialization failed:", error.message);
+}
 const app = express();
 
 app.use(cors());
