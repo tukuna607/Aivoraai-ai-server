@@ -52,7 +52,8 @@ const API_URL =
 const MAX_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 55000;
 const PHOTO_DAILY_LIMIT = 5;
-
+const VOICE_DAILY_LIMIT_SECONDS = 600;
+const VOICE_HEARTBEAT_MAX_SECONDS = 45;
 // Firebase login verification
 async function verifyFirebaseUser(req, res, next) {
   try {
@@ -356,6 +357,356 @@ async function askGemini(message, imageBase64, mimeType) {
   throw error;
 }
 
+// =====================================
+// VOICE MODE DAILY LIMIT SYSTEM
+// =====================================
+
+// Start voice session
+app.post(
+  "/voice/start",
+  verifyFirebaseUser,
+  async (req, res) => {
+    try {
+      const uid = req.user.uid;
+      const date = getIndiaDate();
+
+      const usageRef = db
+        .collection("users")
+        .doc(uid)
+        .collection("usage")
+        .doc(date);
+
+      const sessionId = crypto.randomBytes(16).toString("hex");
+
+      const sessionRef = db
+        .collection("users")
+        .doc(uid)
+        .collection("voiceSessions")
+        .doc(sessionId);
+
+      const now = Date.now();
+
+      const result = await db.runTransaction(async transaction => {
+        const usageSnap = await transaction.get(usageRef);
+
+        const used = usageSnap.exists
+          ? Number(usageSnap.get("voiceSeconds") || 0)
+          : 0;
+
+        if (used >= VOICE_DAILY_LIMIT_SECONDS) {
+          return {
+            allowed: false,
+            used: used,
+            remaining: 0
+          };
+        }
+
+        const oldSessionId = usageSnap.exists
+          ? usageSnap.get("activeVoiceSessionId")
+          : null;
+
+        let oldSessionRef = null;
+        let oldSessionSnap = null;
+
+        if (oldSessionId) {
+          oldSessionRef = db
+            .collection("users")
+            .doc(uid)
+            .collection("voiceSessions")
+            .doc(oldSessionId);
+
+          oldSessionSnap = await transaction.get(oldSessionRef);
+        }
+
+        if (
+          oldSessionSnap &&
+          oldSessionSnap.exists &&
+          oldSessionSnap.get("status") === "active"
+        ) {
+          const lastHeartbeat = Number(
+            oldSessionSnap.get("lastHeartbeatAt") || 0
+          );
+
+          if (now - lastHeartbeat < 60000) {
+            return {
+              allowed: false,
+              active: true
+            };
+          }
+
+          transaction.update(oldSessionRef, {
+            status: "expired",
+            stoppedAt: now
+          });
+        }
+
+        transaction.create(sessionRef, {
+          date: date,
+          status: "active",
+          startedAt: now,
+          lastHeartbeatAt: now
+        });
+
+        transaction.set(
+          usageRef,
+          {
+            date: date,
+            activeVoiceSessionId: sessionId,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+
+        return {
+          allowed: true,
+          sessionId: sessionId,
+          used: used,
+          remaining: VOICE_DAILY_LIMIT_SECONDS - used
+        };
+      });
+
+      if (!result.allowed) {
+        return res.status(429).json({
+          error: result.active
+            ? "VOICE_SESSION_ACTIVE"
+            : "VOICE_DAILY_LIMIT",
+          limit: VOICE_DAILY_LIMIT_SECONDS,
+          used: result.used || 0,
+          remaining: result.remaining || 0,
+          reply: result.active
+            ? "A voice session is already active."
+            : "Your daily voice limit of 10 minutes has been reached."
+        });
+      }
+
+      return res.json(result);
+
+    } catch (error) {
+      console.error("Voice start failed:", error.message);
+
+      return res.status(500).json({
+        error: "VOICE_START_FAILED",
+        reply: "Could not start voice mode."
+      });
+    }
+  }
+);
+
+
+// Voice heartbeat
+app.post(
+  "/voice/heartbeat",
+  verifyFirebaseUser,
+  async (req, res) => {
+    try {
+      const uid = req.user.uid;
+      const sessionId = req.body?.sessionId;
+
+      if (
+        typeof sessionId !== "string" ||
+        !/^[a-f0-9]{32}$/.test(sessionId)
+      ) {
+        return res.status(400).json({
+          error: "INVALID_SESSION"
+        });
+      }
+
+      const sessionRef = db
+        .collection("users")
+        .doc(uid)
+        .collection("voiceSessions")
+        .doc(sessionId);
+
+      const now = Date.now();
+      const today = getIndiaDate();
+
+      const result = await db.runTransaction(async transaction => {
+        const sessionSnap = await transaction.get(sessionRef);
+
+        if (!sessionSnap.exists ||
+            sessionSnap.get("status") !== "active") {
+          return { active: false };
+        }
+
+        const sessionDate = sessionSnap.get("date");
+
+        const usageRef = db
+          .collection("users")
+          .doc(uid)
+          .collection("usage")
+          .doc(sessionDate);
+
+        const usageSnap = await transaction.get(usageRef);
+
+        if (sessionDate !== today) {
+          transaction.update(sessionRef, {
+            status: "stopped",
+            stoppedAt: now
+          });
+
+          if (
+            usageSnap.exists &&
+            usageSnap.get("activeVoiceSessionId") === sessionId
+          ) {
+            transaction.set(usageRef, {
+              activeVoiceSessionId: null
+            }, { merge: true });
+          }
+
+          return {
+            active: false,
+            dayReset: true
+          };
+        }
+
+        const last = Number(
+          sessionSnap.get("lastHeartbeatAt") || now
+        );
+
+        const elapsed = Math.min(
+          VOICE_HEARTBEAT_MAX_SECONDS,
+          Math.max(0, Math.floor((now - last) / 1000))
+        );
+
+        const used = usageSnap.exists
+          ? Number(usageSnap.get("voiceSeconds") || 0)
+          : 0;
+
+        const newUsed = Math.min(
+          VOICE_DAILY_LIMIT_SECONDS,
+          used + elapsed
+        );
+
+        const remaining = VOICE_DAILY_LIMIT_SECONDS - newUsed;
+        const shouldStop = remaining <= 0;
+
+        transaction.set(usageRef, {
+          date: sessionDate,
+          voiceSeconds: newUsed,
+          activeVoiceSessionId: shouldStop ? null : sessionId,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        transaction.update(sessionRef, {
+          lastHeartbeatAt: now,
+          status: shouldStop ? "stopped" : "active",
+          stoppedAt: shouldStop ? now : null
+        });
+
+        return {
+          active: !shouldStop,
+          used: newUsed,
+          remaining: remaining
+        };
+      });
+
+      return res.json(result);
+
+    } catch (error) {
+      console.error("Voice heartbeat failed:", error.message);
+
+      return res.status(500).json({
+        error: "VOICE_HEARTBEAT_FAILED"
+      });
+    }
+  }
+);
+
+
+// Stop voice session
+app.post(
+  "/voice/stop",
+  verifyFirebaseUser,
+  async (req, res) => {
+    try {
+      const uid = req.user.uid;
+      const sessionId = req.body?.sessionId;
+
+      if (
+        typeof sessionId !== "string" ||
+        !/^[a-f0-9]{32}$/.test(sessionId)
+      ) {
+        return res.status(400).json({
+          error: "INVALID_SESSION"
+        });
+      }
+
+      const sessionRef = db
+        .collection("users")
+        .doc(uid)
+        .collection("voiceSessions")
+        .doc(sessionId);
+
+      const now = Date.now();
+
+      const result = await db.runTransaction(async transaction => {
+        const sessionSnap = await transaction.get(sessionRef);
+
+        if (!sessionSnap.exists ||
+            sessionSnap.get("status") !== "active") {
+          return { stopped: true };
+        }
+
+        const date = sessionSnap.get("date");
+
+        const usageRef = db
+          .collection("users")
+          .doc(uid)
+          .collection("usage")
+          .doc(date);
+
+        const usageSnap = await transaction.get(usageRef);
+
+        const last = Number(
+          sessionSnap.get("lastHeartbeatAt") || now
+        );
+
+        const elapsed = Math.min(
+          VOICE_HEARTBEAT_MAX_SECONDS,
+          Math.max(0, Math.floor((now - last) / 1000))
+        );
+
+        const used = usageSnap.exists
+          ? Number(usageSnap.get("voiceSeconds") || 0)
+          : 0;
+
+        const newUsed = Math.min(
+          VOICE_DAILY_LIMIT_SECONDS,
+          used + elapsed
+        );
+
+        transaction.set(usageRef, {
+          date: date,
+          voiceSeconds: newUsed,
+          activeVoiceSessionId: null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        transaction.update(sessionRef, {
+          status: "stopped",
+          lastHeartbeatAt: now,
+          stoppedAt: now
+        });
+
+        return {
+          stopped: true,
+          used: newUsed,
+          remaining: VOICE_DAILY_LIMIT_SECONDS - newUsed
+        };
+      });
+
+      return res.json(result);
+
+    } catch (error) {
+      console.error("Voice stop failed:", error.message);
+
+      return res.status(500).json({
+        error: "VOICE_STOP_FAILED"
+      });
+    }
+  }
+);
+      
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
