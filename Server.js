@@ -52,6 +52,83 @@ const API_URL =
 const MAX_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 55000;
 const PHOTO_DAILY_LIMIT = 5;
+const FILE_DAILY_LIMIT = 3;
+// Reserve one file analysis
+async function reserveFileUsage(uid) {
+  const date = getIndiaDate();
+
+  const usageRef = db
+    .collection("users")
+    .doc(uid)
+    .collection("usage")
+    .doc(date);
+
+  return await db.runTransaction(async transaction => {
+    const snapshot = await transaction.get(usageRef);
+
+    const currentCount = snapshot.exists
+      ? Number(snapshot.get("fileCount") || 0)
+      : 0;
+
+    if (currentCount >= FILE_DAILY_LIMIT) {
+      return {
+        allowed: false,
+        used: currentCount,
+        remaining: 0
+      };
+    }
+
+    const newCount = currentCount + 1;
+
+    transaction.set(
+      usageRef,
+      {
+        date: date,
+        fileCount: newCount,
+        updatedAt:
+          admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    return {
+      allowed: true,
+      used: newCount,
+      remaining: FILE_DAILY_LIMIT - newCount,
+      usageRef: usageRef
+    };
+  });
+}
+
+// Refund file usage if Gemini request fails
+async function refundFileUsage(usageRef) {
+  if (!usageRef) return;
+
+  try {
+    await db.runTransaction(async transaction => {
+      const snapshot = await transaction.get(usageRef);
+
+      if (!snapshot.exists) return;
+
+      const count = Number(
+        snapshot.get("fileCount") || 0
+      );
+
+      if (count > 0) {
+        transaction.update(usageRef, {
+          fileCount: count - 1,
+          updatedAt:
+            admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    });
+  } catch (error) {
+    console.error(
+      "File usage refund failed:",
+      error.message
+    );
+  }
+}
 const VOICE_DAILY_LIMIT_SECONDS = 600;
 const VOICE_HEARTBEAT_MAX_SECONDS = 45;
 // Firebase login verification
@@ -232,7 +309,14 @@ function extractText(data) {
   return "";
 }
 
-async function askGemini(message, imageBase64, mimeType) {
+
+async function askGemini(
+  message,
+  imageBase64,
+  mimeType,
+  fileBase64,
+  fileMimeType
+) {
   let lastStatus = 502;
   let lastMessage = "Gemini request failed";
 
@@ -259,6 +343,25 @@ async function askGemini(message, imageBase64, mimeType) {
         });
       }
 
+      if (fileBase64 && fileMimeType === "application/pdf") {
+        input.push({
+          type: "document",
+          data: fileBase64,
+          mime_type: "application/pdf"
+        });
+      }
+
+      if (fileBase64 && fileMimeType === "text/plain") {
+        const fileText = Buffer
+          .from(fileBase64, "base64")
+          .toString("utf8");
+
+        input.push({
+          type: "text",
+          text: "Uploaded file content:\n" + fileText
+        });
+      }
+
       input.push({
         type: "text",
         text: message
@@ -272,7 +375,10 @@ async function askGemini(message, imageBase64, mimeType) {
         },
         body: JSON.stringify({
           model: GEMINI_MODEL,
-          input: imageBase64 ? input : message,
+          input:
+            imageBase64 || fileBase64
+              ? input
+              : message,
           system_instruction:
             "You are Aivora AI, an intelligent all-in-one personal AI assistant. " +
             "Help users with coding, Android app development, APK creation, " +
@@ -280,7 +386,7 @@ async function askGemini(message, imageBase64, mimeType) {
             "Give accurate, clear and useful answers. " +
             "Guide beginners step by step. " +
             "When providing code, provide complete and compatible code. " +
-            "Analyze uploaded images carefully. " +
+            "Analyze uploaded images and documents carefully. " +
             "Reply in the user's preferred language. " +
             "Never invent facts or claim capabilities you do not have. " +
             "When asked about your underlying technology, answer honestly."
@@ -355,7 +461,8 @@ async function askGemini(message, imageBase64, mimeType) {
   const error = new Error(lastMessage);
   error.status = lastStatus;
   throw error;
-}
+      }
+          
 
 // =====================================
 // VOICE MODE DAILY LIMIT SYSTEM
@@ -727,6 +834,7 @@ app.get("/health", (req, res) => {
   });
 });
 
+
 app.post(
   "/chat",
   verifyFirebaseUser,
@@ -749,10 +857,30 @@ app.post(
         ? req.body.mimeType
         : "image/jpeg";
 
-    if (!message && !imageBase64) {
+    const fileBase64 =
+      typeof req.body?.fileBase64 === "string"
+        ? req.body.fileBase64.replace(
+            /^data:[^;]+;base64,/,
+            ""
+          )
+        : "";
+
+    const fileMimeType =
+      typeof req.body?.fileMimeType === "string"
+        ? req.body.fileMimeType
+        : "";
+
+    if (!message && !imageBase64 && !fileBase64) {
       return res.status(400).json({
-        error: "Message or image required",
-        reply: "Please enter a message or select a photo."
+        error: "Input required",
+        reply: "Please enter a message or select a file."
+      });
+    }
+
+    if (imageBase64 && fileBase64) {
+      return res.status(400).json({
+        error: "One attachment at a time",
+        reply: "Please send an image or a document separately."
       });
     }
 
@@ -774,14 +902,44 @@ app.post(
         });
       }
 
-      const estimatedSize = Math.floor(
+      const imageSize = Math.floor(
         imageBase64.length * 3 / 4
       );
 
-      if (estimatedSize > 14 * 1024 * 1024) {
+      if (imageSize > 14 * 1024 * 1024) {
         return res.status(413).json({
           error: "Image too large",
           reply: "Please select an image smaller than 14 MB."
+        });
+      }
+    }
+
+    if (fileBase64) {
+      if (
+        !["application/pdf", "text/plain"]
+          .includes(fileMimeType)
+      ) {
+        return res.status(400).json({
+          error: "Unsupported file type",
+          reply: "Only PDF and TXT files are supported."
+        });
+      }
+
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(fileBase64)) {
+        return res.status(400).json({
+          error: "Invalid file data",
+          reply: "The selected file data is invalid."
+        });
+      }
+
+      const fileSize = Math.floor(
+        fileBase64.length * 3 / 4
+      );
+
+      if (fileSize > 12 * 1024 * 1024) {
+        return res.status(413).json({
+          error: "File too large",
+          reply: "Please select a file smaller than 12 MB."
         });
       }
     }
@@ -794,9 +952,9 @@ app.post(
     }
 
     let photoReservation = null;
+    let fileReservation = null;
 
     try {
-      // Enforce photo daily limit
       if (imageBase64) {
         photoReservation = await reservePhotoUsage(
           req.user.uid
@@ -814,13 +972,34 @@ app.post(
         }
       }
 
+      if (fileBase64) {
+        fileReservation = await reserveFileUsage(
+          req.user.uid
+        );
+
+        if (!fileReservation.allowed) {
+          return res.status(429).json({
+            error: "FILE_DAILY_LIMIT",
+            limit: FILE_DAILY_LIMIT,
+            used: fileReservation.used,
+            remaining: 0,
+            reply:
+              "Your daily file analysis limit of 3 has been reached. Please try again after midnight."
+          });
+        }
+      }
+
       const prompt = message ||
-        "Please describe this image in detail.";
+        (imageBase64
+          ? "Please describe this image in detail."
+          : "Please analyze this uploaded file in detail.");
 
       const result = await askGemini(
         prompt,
         imageBase64,
-        mimeType
+        mimeType,
+        fileBase64,
+        fileMimeType
       );
 
       if (imageBase64) {
@@ -831,11 +1010,27 @@ app.post(
         };
       }
 
+      if (fileBase64) {
+        result.fileUsage = {
+          limit: FILE_DAILY_LIMIT,
+          used: fileReservation.used,
+          remaining: fileReservation.remaining
+        };
+      }
+
       return res.status(200).json(result);
 
     } catch (error) {
       if (photoReservation && photoReservation.usageRef) {
-        await refundPhotoUsage(photoReservation.usageRef);
+        await refundPhotoUsage(
+          photoReservation.usageRef
+        );
+      }
+
+      if (fileReservation && fileReservation.usageRef) {
+        await refundFileUsage(
+          fileReservation.usageRef
+        );
       }
 
       const status = error.status || 502;
@@ -865,6 +1060,7 @@ app.post(
     }
   }
 );
+
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Aivora AI server running on port " + PORT);
